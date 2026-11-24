@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="scope" aria-hidden="true"><span class="sweep"></span><span class="blip b1"></span><span class="blip b2"></span><span class="blip b3"></span></div>
+    <div>
+      <h1>TOKEN LAUNCH RADAR</h1>
+      <p class="tagline">Every protocol that records no token yet, ranked by what its launch could be worth — and how to farm it first.</p>
+    </div>
+  </div>
+  <div class="stamp">
+    <div>Snapshot <strong id="asOf">—</strong></div>
+    <div>Source: DefiLlama protocol index (sealed)</div>
+    <div>Model <strong id="modelVersion">—</strong></div>
+  </div>
+</header>
+
+<section class="stats" id="stats"></section>
+
+<section class="model panel" id="modelPanel">
+  <h2>How the ranking works</h2>
+  <p class="model-text">
+    Implied value is calibrated on the protocols that already trade. For each category, the model takes the
+    <em>median market-cap / TVL ratio of that category's tokened protocols</em> and applies it to the pre-token
+    protocols in the same category, then adjusts for 7-day TVL momentum and for how long the protocol has run
+    without a token: <code>implied = TVL × peer multiple × growth factor × maturity factor</code>.
+    Categories with too few tokened peers fall back to the global median (<span id="globalMult">—</span>).
+    Before any ranking, a structural screen sets aside <span id="setAside">—</span> entries that record no token but are
+    wrapped, staked or bridged products of one that already trades — or an exchange's reserve tracker — using the same
+    signals the snapshot's own watchlist uses: their value already trades under another name, so they have no launch of their own.
+    No name is hand-picked or hand-weighted: feed the model a new snapshot and the board re-derives itself.
+    A protocol here <em>records no token</em> in the snapshot — that is a statement about the record, not a promise of a launch.
+  </p>
+  <div class="mults" id="mults"></div>
+</section>
+
+<main id="boardView">
+  <section class="controls panel">
+    <label>Search <input id="q" type="search" placeholder="name or slug…"></label>
+    <label>Category <select id="cat"></select></label>
+    <label>Chain <select id="chain"></select></label>
+    <label>Min TVL <select id="minTvl">
+      <option value="0">Any</option><option value="10000000">$10M</option><option value="50000000">$50M</option>
+      <option value="250000000">$250M</option><option value="1000000000">$1B</option>
+    </select></label>
+    <label>Sort by <select id="sort">
+      <option value="rank">Rank (implied value)</option><option value="tvl">TVL</option>
+      <option value="growth">7d growth</option><option value="age">Age without token</option><option value="signal">Signal score</option>
+    </select></label>
+    <label class="check"><input id="watchOnly" type="checkbox"> Watchlist only (TVL ≥ $50M)</label>
+    <span class="count" id="count"></span>
+  </section>
+
+  <section class="panel tablewrap">
+    <table id="board">
+      <thead><tr>
+        <th class="num">#</th><th>Protocol</th><th>Category</th><th>Chains</th>
+        <th class="num">TVL</th><th class="num">7d %</th><th class="num">Age</th>
+        <th class="num">Peer ×</th><th class="num">Implied value</th><th>Signal</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+</main>
+
+<main id="detailView" hidden></main>
+
+<section class="panel live">
+  <h2>Already trading — the calibration peers</h2>
+  <p class="model-text">These protocols have a token, so the radar never ranks them. Their market-cap / TVL ratios are the yardstick the model above is built from; the median per category is what a pre-token protocol in that category is valued with.</p>
+  <table id="liveTable">
+    <thead><tr><th>Protocol</th><th>Symbol</th><th>Category</th><th class="num">TVL</th><th class="num">Market cap</th><th class="num">MCap / TVL</th></tr></thead>
+    <tbody id="liveRows"></tbody>
+  </table>
+</section>
+
+<footer>
+  <p>Implied values are this model's own estimates from one sealed snapshot's figures — TVL, 7-day change, listing age and peer ratios. They are not prices, predictions or advice, and a protocol that records no token may never issue one. Farm plans carry real cost and risk; size positions accordingly.</p>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
