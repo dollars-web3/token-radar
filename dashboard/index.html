@@ -27,14 +27,29 @@
 <section class="model panel" id="modelPanel">
   <h2>How the ranking works</h2>
   <p class="model-text">
-    Implied value is calibrated on the protocols that already trade. For each category, the model takes the
-    <em>median market-cap / TVL ratio of that category's tokened protocols</em> and applies it to the pre-token
-    protocols in the same category, then adjusts for 7-day TVL momentum and for how long the protocol has run
-    without a token: <code>implied = TVL × peer multiple × growth factor × maturity factor</code>.
-    Categories with too few tokened peers fall back to the global median (<span id="globalMult">—</span>).
-    Before any ranking, a structural screen sets aside <span id="setAside">—</span> entries that record no token but are
-    wrapped, staked or bridged products of one that already trades — or an exchange's reserve tracker — using the same
-    signals the snapshot's own watchlist uses: their value already trades under another name, so they have no launch of their own.
+    Implied value is calibrated on the <span id="fitPeers">—</span> protocols that already trade with a usable
+    market cap. For each category the model takes the <em>median market-cap / TVL ratio of that category's
+    tokened protocols</em>, then applies three fitted adjustments:
+    <code>implied = TVL × peer multiple × size factor × growth factor × maturity factor</code>.
+    The size and growth terms are not hand-set — they are fitted on the peers themselves (least squares on
+    their log ratios, each shrunk halfway to zero). Peer ratios <em>fall</em> as TVL grows (fitted slope
+    <span id="sizeSlope">—</span>), so the size factor tempers the largest protocols instead of letting a raw
+    multiple overvalue them. A hot week of inflows prices at a <em>discount</em> among peers that already
+    trade (fitted momentum beta <span id="growthBeta">—</span>), so the growth factor tempers momentum
+    rather than chasing it; the maturity factor is kept deliberately small, because the peers show almost
+    no age effect. Categories with too few tokened peers fall back to the global median
+    (<span id="globalMult">—</span>). Each protocol's detail view also shows a value range: its category's
+    interquartile peer multiples (25th–75th percentile) put through the same factors.
+  </p>
+  <p class="model-text">
+    The model grades itself on this page: re-pricing every peer with that peer left out of the fit, its
+    median miss is a factor of <strong id="looModel">—</strong>, against <strong id="looBase">—</strong> for a plain
+    median-multiple model with hand-set adjustments — the fitted terms earn their place, and the remaining
+    spread is why every row carries a range, not just a point.
+    Before any ranking, a structural screen sets aside <span id="setAside">—</span> entries that record no
+    token but are wrapped, staked or bridged products of one that already trades — or an exchange's reserve
+    tracker — using the same signals the snapshot's own watchlist uses: their value already trades under
+    another name, so they have no launch of their own. They are listed, with their reasons, below the board.
     No name is hand-picked or hand-weighted: feed the model a new snapshot and the board re-derives itself.
     A protocol here <em>records no token</em> in the snapshot — that is a statement about the record, not a promise of a launch.
   </p>
@@ -79,6 +94,16 @@
     <thead><tr><th>Protocol</th><th>Symbol</th><th>Category</th><th class="num">TVL</th><th class="num">Market cap</th><th class="num">MCap / TVL</th></tr></thead>
     <tbody id="liveRows"></tbody>
   </table>
+</section>
+
+<section class="panel aside">
+  <h2>Set aside — products of tokens that already trade</h2>
+  <p class="model-text">These entries record no token of their own, so the screen keeps them off the board: each is a wrapped, staked or bridged product of a token that already trades, a later version of one, or an exchange's reserve tracker. The largest are listed here with the reason each was set aside; the full list is in the page's data.</p>
+  <table id="asideTable">
+    <thead><tr><th>Protocol</th><th>Category</th><th class="num">TVL</th><th>Why set aside</th></tr></thead>
+    <tbody id="asideRows"></tbody>
+  </table>
+  <p class="model-text" id="asideCount"></p>
 </section>
 
 <footer>

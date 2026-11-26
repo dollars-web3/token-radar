@@ -8,16 +8,28 @@
 //
 // Implied value is derived only from the snapshot's own figures, the same function for every row:
 //
-//   peers      = the protocols in the same category whose token already trades (mcap and TVL known)
-//   multiple   = median(mcap / TVL) over those peers, clamped to [0.05, 8]; a category with fewer
-//                than PEER_MIN peers falls back to the median over every tokened protocol
-//   growthMult = 1 + 0.6 x clamp(change_7d, -50, 100) / 100     (no reported change: 1.0)
-//   ageMult    = 0.8 + 0.4 x min(age_days, 1460) / 1460         (age unknown: 365 days)
-//   implied    = round(TVL x multiple x growthMult x ageMult), at least 1
+//   peers      = the protocols whose token already trades with a usable market cap (mcap > 0)
+//   multiple   = median(mcap / TVL) over the peers in the same category, clamped to [0.05, 8];
+//                a category with fewer than PEER_MIN peers falls back to the global median
+//   sizeMult   = exp(SHRINK x size_slope x (ln TVL - median ln TVL of the peers)), clamped:
+//                the peers' own ratios fall as TVL grows (fitted slope about -0.48), so a raw
+//                median multiple overvalues the largest protocols; the fit corrects that
+//   growthMult = exp(SHRINK x growth_beta x clamp(change_7d, -30, 30)), 1.0 when unreported:
+//                the fitted beta is negative (about -0.04 per +1%) — among peers that already
+//                trade, a hot week of inflows prices at a discount, not a premium, so the model
+//                tempers momentum instead of chasing it
+//   ageMult    = 0.9 + 0.2 x min(age_days, 1460) / 1460 (age unknown: 365 days), kept small
+//                on purpose: the peers show almost no age effect on their ratios
+//   implied    = round(TVL x multiple x sizeMult x growthMult x ageMult), at least 1
 //
-// No protocol name is ever special-cased: change the snapshot and the board re-derives itself.
-// The constants are stated on the dashboard, and the page recomputes every row from the same
-// inputs, so what the reader sees is the arithmetic the board.json file carries.
+// The two slopes are FITTED on the peer set at run time (ordinary least squares on the log
+// ratios), shrunk halfway to zero, and printed on the dashboard next to a leave-one-out
+// check: the same program re-prices every peer with itself left out, for this model and for
+// a plain median-multiple baseline, and reports both median errors. Nothing is hand-tuned
+// per protocol and no name is special-cased: change the snapshot and the board re-derives
+// itself. Each row also carries a value band — its category's interquartile peer multiples
+// (25th to 75th percentile) put through the same factors — so the reader sees the spread
+// the point estimate hides.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -42,22 +54,25 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The model's constants, stated on the dashboard. */
+/** The model's constants, stated on the dashboard. The two slopes are fitted, not here. */
 export const MODEL = {
   peer_min: 3,
   multiple_floor: 0.05,
   multiple_cap: 8,
-  growth_weight: 0.6,
-  growth_floor: -50,
-  growth_cap: 100,
-  age_floor: 0.8,
-  age_range: 0.4,
+  fit_shrink: 0.5,
+  size_floor: 0.4,
+  size_cap: 2.5,
+  growth_change_clamp: 30,
+  growth_floor: 0.53,
+  growth_cap: 1.87,
+  age_floor: 0.9,
+  age_range: 0.2,
   age_days_cap: 1460,
   unknown_age_days: 365,
 } as const;
 
 /** The model's version label, named on the dashboard. */
-export const MODEL_VERSION = 'radar-2 (peer-calibrated)';
+export const MODEL_VERSION = 'radar-3 (fitted peer model)';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -81,8 +96,11 @@ export interface BoardRow {
   multiple: number;
   peer_count: number;
   peer_basis: string;
+  size_mult: number;
   growth_mult: number;
   age_mult: number;
+  band_low_usd: number;
+  band_high_usd: number;
   signal: number;
   watchlist: boolean;
   steps: FarmStep[];
@@ -99,6 +117,24 @@ export interface LiveRow {
   symbol: string | null;
 }
 
+/** The fitted terms and the leave-one-out check, computed on the peer set at run time. */
+export interface FitStats {
+  peers: number;
+  size_slope: number;
+  growth_beta: number;
+  loo_model: number;
+  loo_baseline: number;
+}
+
+/** A pre-token entry the structural screen set aside, with the reason it was set aside. */
+export interface AsideRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  reason: string;
+}
+
 /** Everything the dashboard renders. */
 export interface Radar {
   as_of: string;
@@ -112,6 +148,8 @@ export interface Radar {
   live: LiveRow[];
   multiples: { category: string; multiple: number; peers: number }[];
   global_multiple: number;
+  fit: FitStats;
+  aside: AsideRow[];
 }
 
 /** Parse and lightly validate the sealed snapshot text. */
@@ -146,12 +184,21 @@ export function recordsNoToken(p: SnapshotProtocol): boolean {
 const SET_ASIDE_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
 const EXCHANGE_PREFIXES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
 
+/** Why the entry is set aside, or null when it belongs on the board. */
+export function setAsideReason(p: SnapshotProtocol): string | null {
+  if (p.category !== null && SET_ASIDE_CATEGORIES.has(p.category)) {
+    return `${p.category} entry: this category holds products of, or trackers for, tokens that already trade — no launch of its own to radar`;
+  }
+  if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return 'name marks it as a wrapped or staked product of a token that already trades';
+  if (/\s(V\d+|v\d+|\d+\.0)$/.test(p.name)) return 'name ends in a version marker: a later version of a protocol whose token already trades';
+  const exchange = EXCHANGE_PREFIXES.find((x) => p.name === x || p.name.startsWith(`${x} `));
+  if (exchange !== undefined) return `an exchange reserve tracker (${exchange}), not a launch candidate`;
+  return null;
+}
+
 /** True when the entry is structurally a product of a token that already trades. */
 export function structurallySetAside(p: SnapshotProtocol): boolean {
-  if (p.category !== null && SET_ASIDE_CATEGORIES.has(p.category)) return true;
-  if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return true;
-  if (/\s(V\d+|v\d+|\d+\.0)$/.test(p.name)) return true;
-  return EXCHANGE_PREFIXES.some((x) => p.name === x || p.name.startsWith(`${x} `));
+  return setAsideReason(p) !== null;
 }
 
 function median(values: number[]): number {
@@ -160,14 +207,24 @@ function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+/** A percentile of a numeric list, by linear interpolation on the sorted copy. */
+function quantile(values: number[], q: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  const at = (sorted.length - 1) * q;
+  const lo = Math.floor(at);
+  const hi = Math.min(sorted.length - 1, lo + 1);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+}
+
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
 }
 
-/** The peer calibration: a mcap/TVL multiple per category, plus the global fallback. */
+/** The peer calibration: a mcap/TVL multiple and its interquartile spread, per category. */
 export function calibrate(protocols: SnapshotProtocol[]): {
-  byCategory: Map<string, { multiple: number; peers: number }>;
-  global: { multiple: number; peers: number };
+  byCategory: Map<string, { multiple: number; peers: number; q1: number; q3: number }>;
+  global: { multiple: number; peers: number; q1: number; q3: number };
 } {
   const ratiosByCategory = new Map<string, number[]>();
   const all: number[] = [];
@@ -180,42 +237,133 @@ export function calibrate(protocols: SnapshotProtocol[]): {
     list.push(ratio);
     ratiosByCategory.set(key, list);
   }
-  const global = { multiple: clamp(median(all), MODEL.multiple_floor, MODEL.multiple_cap), peers: all.length };
-  const byCategory = new Map<string, { multiple: number; peers: number }>();
+  const spread = (ratios: number[]) => ({
+    multiple: clamp(median(ratios), MODEL.multiple_floor, MODEL.multiple_cap),
+    peers: ratios.length,
+    q1: clamp(quantile(ratios, 0.25), MODEL.multiple_floor, MODEL.multiple_cap),
+    q3: clamp(quantile(ratios, 0.75), MODEL.multiple_floor, MODEL.multiple_cap),
+  });
+  const global = spread(all);
+  const byCategory = new Map<string, { multiple: number; peers: number; q1: number; q3: number }>();
   for (const [category, ratios] of ratiosByCategory) {
     if (ratios.length >= MODEL.peer_min) {
-      byCategory.set(category, { multiple: clamp(median(ratios), MODEL.multiple_floor, MODEL.multiple_cap), peers: ratios.length });
+      byCategory.set(category, spread(ratios));
     }
   }
   return { byCategory, global };
 }
 
-/** The multiple one protocol is valued with, and where it came from. */
+/** The multiple one protocol is valued with, where it came from, and its peer spread. */
 function multipleFor(
   p: SnapshotProtocol,
   calib: ReturnType<typeof calibrate>,
-): { multiple: number; peers: number; basis: string } {
+): { multiple: number; peers: number; basis: string; q1: number; q3: number } {
   const own = p.category === null ? undefined : calib.byCategory.get(p.category);
   if (own !== undefined) {
-    return { multiple: own.multiple, peers: own.peers, basis: `median of ${own.peers} tokened ${p.category} peers` };
+    return { multiple: own.multiple, peers: own.peers, basis: `median of ${own.peers} tokened ${p.category} peers`, q1: own.q1, q3: own.q3 };
   }
   return {
     multiple: calib.global.multiple,
     peers: calib.global.peers,
     basis: `global median of ${calib.global.peers} tokened protocols (too few tokened ${p.category ?? 'uncategorised'} peers to calibrate)`,
+    q1: calib.global.q1,
+    q3: calib.global.q3,
   };
 }
 
-/** The growth multiplier from the 7-day TVL change; 1.0 when the snapshot reports none. */
-export function growthMult(change7d: number | null): number {
-  if (change7d === null) return 1;
-  return 1 + (MODEL.growth_weight * clamp(change7d, MODEL.growth_floor, MODEL.growth_cap)) / 100;
+/** The size factor: peer ratios shrink as TVL grows, so big protocols are tempered. */
+export function sizeMult(tvl: number, medianLogTvl: number, sizeSlope: number): number {
+  return clamp(Math.exp(MODEL.fit_shrink * sizeSlope * (Math.log(Math.max(1, tvl)) - medianLogTvl)), MODEL.size_floor, MODEL.size_cap);
 }
 
-/** The maturity multiplier from the protocol's age; an unknown age scores as one year. */
+/** The growth factor, from the fitted momentum beta; 1.0 when the snapshot reports none. */
+export function growthMult(change7d: number | null, growthBeta: number): number {
+  if (change7d === null) return 1;
+  return clamp(Math.exp(MODEL.fit_shrink * growthBeta * clamp(change7d, -MODEL.growth_change_clamp, MODEL.growth_change_clamp)), MODEL.growth_floor, MODEL.growth_cap);
+}
+
+/** The maturity factor from the protocol's age; an unknown age scores as one year. */
 export function ageMult(age: number | null): number {
   const days = age ?? MODEL.unknown_age_days;
   return MODEL.age_floor + (MODEL.age_range * Math.min(days, MODEL.age_days_cap)) / MODEL.age_days_cap;
+}
+
+/** Ordinary least squares slope of ys on xs; 0 when xs do not vary. */
+function olsSlope(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 3) return 0;
+  const mx = xs.reduce((s, x) => s + x, 0) / n;
+  const my = ys.reduce((s, y) => s + y, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i]! - mx) * (ys[i]! - my);
+    den += (xs[i]! - mx) ** 2;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+/** The protocols the fit learns from: a token recorded, a usable market cap, a real TVL. */
+export function usablePeers(protocols: SnapshotProtocol[]): SnapshotProtocol[] {
+  return protocols.filter((p) => !recordsNoToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+}
+
+/** Price one protocol with the fitted model, given a calibration and a fit. */
+function fittedPrice(
+  p: SnapshotProtocol,
+  calib: ReturnType<typeof calibrate>,
+  fit: { sizeSlope: number; growthBeta: number; medianLogTvl: number },
+  asOf: string,
+): number {
+  const { multiple } = multipleFor(p, calib);
+  return p.tvl_usd * multiple * sizeMult(p.tvl_usd, fit.medianLogTvl, fit.sizeSlope) * growthMult(p.change_7d, fit.growthBeta) * ageMult(ageDays(p.listed_at, asOf));
+}
+
+/** Price one protocol with the plain baseline: median multiple, hand-set momentum and age. */
+function baselinePrice(p: SnapshotProtocol, calib: ReturnType<typeof calibrate>, asOf: string): number {
+  const { multiple } = multipleFor(p, calib);
+  const g = p.change_7d === null ? 1 : 1 + (0.6 * clamp(p.change_7d, -50, 100)) / 100;
+  const days = ageDays(p.listed_at, asOf) ?? 365;
+  const a = 0.8 + (0.4 * Math.min(days, 1460)) / 1460;
+  return p.tvl_usd * multiple * g * a;
+}
+
+/**
+ * Fit the model's two slopes on the peer set, and grade the fit honestly: every peer is
+ * re-priced with itself left out of the calibration and the fit, for this model and for
+ * the plain baseline, and the two median log errors are reported side by side.
+ */
+export function fitModel(snapshot: Snapshot): { sizeSlope: number; growthBeta: number; medianLogTvl: number; looModel: number; looBaseline: number; peers: number } {
+  const peers = usablePeers(snapshot.protocols);
+  const logTvls = peers.map((p) => Math.log(p.tvl_usd));
+  const logRatios = peers.map((p) => Math.log(p.mcap_usd! / p.tvl_usd));
+  const sizeSlope = olsSlope(logTvls, logRatios);
+  const withChange = peers.filter((p) => p.change_7d !== null);
+  const growthBeta = olsSlope(
+    withChange.map((p) => p.change_7d!),
+    withChange.map((p) => Math.log(p.mcap_usd! / p.tvl_usd)),
+  );
+  const medianLogTvl = median(logTvls);
+  const fit = { sizeSlope, growthBeta, medianLogTvl };
+
+  const modelErr: number[] = [];
+  const baseErr: number[] = [];
+  for (const peer of peers) {
+    const rest = snapshot.protocols.filter((q) => q !== peer);
+    const calib = calibrate(rest);
+    const restPeers = usablePeers(rest);
+    const refit = {
+      sizeSlope: olsSlope(restPeers.map((p) => Math.log(p.tvl_usd)), restPeers.map((p) => Math.log(p.mcap_usd! / p.tvl_usd))),
+      growthBeta: olsSlope(
+        restPeers.filter((p) => p.change_7d !== null).map((p) => p.change_7d!),
+        restPeers.filter((p) => p.change_7d !== null).map((p) => Math.log(p.mcap_usd! / p.tvl_usd)),
+      ),
+      medianLogTvl: median(restPeers.map((p) => Math.log(p.tvl_usd))),
+    };
+    modelErr.push(Math.abs(Math.log(fittedPrice(peer, calib, refit, snapshot.as_of) / peer.mcap_usd!)));
+    baseErr.push(Math.abs(Math.log(baselinePrice(peer, calib, snapshot.as_of) / peer.mcap_usd!)));
+  }
+  return { ...fit, looModel: median(modelErr), looBaseline: median(baseErr), peers: peers.length };
 }
 
 /** Percentile (0..1) of value within a sorted-ascending copy of the population. */
@@ -368,6 +516,28 @@ const CHAIN: Playbook = (p) => {
   ]);
 };
 
+const BASIS: Playbook = (p) => {
+  const chain = p.chains[0] ?? 'Ethereum';
+  const t = tierOf(p.tvl_usd);
+  return steps(p, [
+    [`Deposit a ${t.stake} ${t.label} position into ${p.name}'s flagship basis vault on ${chain}; vault depositors are the cohort a launch rewards, and basis vaults are small enough that early depositors are visible.`, 'Gas $5–$30', '15 minutes'],
+    [`Keep the deposit in through at least two full funding-rate cycles (typically a month) instead of withdrawing after a good week; duration is what separates vault users from yield tourists in the records.`, 'Opportunity cost only', '1+ month holding'],
+    [`Add a second, smaller deposit on a different day each month, so the address shows recurring commitment rather than one parked lump sum.`, 'From $200 plus gas', '10 minutes a month'],
+    [`If the protocol lists its vault shares in a money market or DEX pool, hold or lend a small amount there too; composability records are cheap to build and often counted separately.`, 'Gas $3–$15', '15 minutes'],
+  ]);
+};
+
+const PREDICTION: Playbook = (p) => {
+  const chain = p.chains[0] ?? 'its main chain';
+  const t = tierOf(p.tvl_usd);
+  return steps(p, [
+    [`Open an account on ${p.name} (${chain}) and trade a first set of markets with a ${t.stake} ${t.label} bankroll, taking real positions rather than one token bet.`, 'Trading spread plus gas, about $2–$10', '20 minutes'],
+    [`Trade on at least 8 separate days a month across different market categories; distinct active days and market breadth are the metrics prediction launches publish.`, 'About $1–$5 a session in spread', '15 minutes a session'],
+    [`Provide two-sided liquidity on one or two long-dated markets if the protocol supports it; market makers are scarce and usually weighted heavily.`, 'From $200 at risk in the market', '20 minutes to set up'],
+    [`Let some positions settle rather than always selling early, so the address shows completed prediction lifecycles through a full quarter.`, 'Settlement is free', '3+ months of activity'],
+  ]);
+};
+
 const GENERIC: Playbook = (p) => {
   const chain = p.chains[0] ?? 'its main chain';
   const t = tierOf(p.tvl_usd);
@@ -402,6 +572,8 @@ const PLAYBOOKS: Record<string, Playbook> = {
   RWA: RWA,
   'Risk Curators': CURATOR,
   'Onchain Capital Allocator': CURATOR,
+  'Basis Trading': BASIS,
+  'Prediction Market': PREDICTION,
   Chain: CHAIN,
 };
 
@@ -424,6 +596,7 @@ export function stepText(s: FarmStep): string {
 /** Build the whole radar from the snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Radar } {
   const calib = calibrate(snapshot.protocols);
+  const fit = fitModel(snapshot);
   const watch = new Set(snapshot.watchlist);
   const noToken = snapshot.protocols.filter(recordsNoToken);
   const preToken = noToken.filter((p) => !structurallySetAside(p));
@@ -433,11 +606,14 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const ages = preToken.map((p) => ageDays(p.listed_at, snapshot.as_of) ?? MODEL.unknown_age_days).sort((a, b) => a - b);
 
   const scored = preToken.map((p) => {
-    const { multiple, peers, basis } = multipleFor(p, calib);
-    const g = growthMult(p.change_7d);
+    const { multiple, peers, basis, q1, q3 } = multipleFor(p, calib);
+    const s = sizeMult(p.tvl_usd, fit.medianLogTvl, fit.sizeSlope);
+    const g = growthMult(p.change_7d, fit.growthBeta);
     const age = ageDays(p.listed_at, snapshot.as_of);
     const a = ageMult(age);
-    const implied = Math.max(1, Math.round(p.tvl_usd * multiple * g * a));
+    const implied = Math.max(1, Math.round(p.tvl_usd * multiple * s * g * a));
+    const bandLow = Math.min(implied, Math.max(1, Math.round(p.tvl_usd * q1 * s * g * a)));
+    const bandHigh = Math.max(implied, Math.round(p.tvl_usd * q3 * s * g * a));
     const signal = Math.round(
       100 * (0.5 * percentile(tvls, Math.log10(Math.max(1, p.tvl_usd))) + 0.3 * percentile(growths, p.change_7d ?? 0) + 0.2 * percentile(ages, age ?? MODEL.unknown_age_days)),
     );
@@ -456,8 +632,11 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       multiple,
       peer_count: peers,
       peer_basis: basis,
+      size_mult: s,
       growth_mult: g,
       age_mult: a,
+      band_low_usd: bandLow,
+      band_high_usd: bandHigh,
       signal,
       watchlist: watch.has(p.slug),
       steps: plan,
@@ -489,6 +668,13 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .map(([category, v]) => ({ category, multiple: v.multiple, peers: v.peers }))
     .sort((x, y) => y.multiple - x.multiple);
 
+  const aside: AsideRow[] = noToken
+    .filter((p) => structurallySetAside(p))
+    .map((p) => ({ slug: p.slug, name: p.name, category: p.category, tvl_usd: p.tvl_usd, reason: setAsideReason(p)! }))
+    .sort((x, y) => y.tvl_usd - x.tvl_usd);
+
+  const round = (x: number, dp: number) => Math.round(x * 10 ** dp) / 10 ** dp;
+
   const radar: Radar = {
     as_of: snapshot.as_of,
     floor_usd: snapshot.floor_usd,
@@ -501,6 +687,14 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     live,
     multiples,
     global_multiple: calib.global.multiple,
+    fit: {
+      peers: fit.peers,
+      size_slope: round(fit.sizeSlope, 4),
+      growth_beta: round(fit.growthBeta, 4),
+      loo_model: round(fit.looModel, 3),
+      loo_baseline: round(fit.looBaseline, 3),
+    },
+    aside,
   };
   return { board: scored, radar };
 }

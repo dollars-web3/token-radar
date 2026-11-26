@@ -1,8 +1,9 @@
 // Token Launch Radar — the page. No network, no framework: every byte it shows comes from
 // ../data.js, which main.ts writes from the same snapshot and the same model as board.json.
 // The implied values below are RECOMPUTED here from each row's raw inputs (TVL, peer multiple,
-// growth and maturity factors) with the model's stated formula, so the page's arithmetic and
-// the board's numbers are visibly one and the same.
+// size, growth and maturity factors) with the model's stated formula, so the page's arithmetic
+// and the board's numbers are visibly one and the same. The size and growth factors use the
+// slopes the program fitted on the peer set; they are printed in the model panel above.
 
 const R = window.RADAR;
 const $ = (id) => document.getElementById(id);
@@ -16,9 +17,9 @@ function fmt(n) {
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
-/** The model's formula, restated: implied = TVL x peer multiple x growth x maturity. */
+/** The model's formula, restated: implied = TVL x peer multiple x size x growth x maturity. */
 function impliedOf(r) {
-  return Math.max(1, Math.round(r.tvl_usd * r.multiple * r.growth_mult * r.age_mult));
+  return Math.max(1, Math.round(r.tvl_usd * r.multiple * r.size_mult * r.growth_mult * r.age_mult));
 }
 function ageLabel(days) {
   if (days === null) return 'unknown';
@@ -31,6 +32,11 @@ $('asOf').textContent = R.as_of;
 $('modelVersion').textContent = R.model_version;
 $('globalMult').textContent = '×' + R.global_multiple.toFixed(2);
 $('setAside').textContent = R.set_aside;
+$('fitPeers').textContent = R.fit.peers;
+$('sizeSlope').textContent = R.fit.size_slope.toFixed(2);
+$('growthBeta').textContent = R.fit.growth_beta.toFixed(3) + ' per +1%';
+$('looModel').textContent = '×' + Math.exp(R.fit.loo_model).toFixed(1);
+$('looBase').textContent = '×' + Math.exp(R.fit.loo_baseline).toFixed(1);
 const totalImplied = R.rows.reduce((s, r) => s + r.implied_value_usd, 0);
 $('stats').innerHTML = [
   [R.scanned, 'protocols scanned'],
@@ -123,9 +129,11 @@ function openDetail(slug) {
     <h2>Why this value</h2>
     <div class="breakdown">
       base&nbsp;&nbsp;&nbsp;= TVL ${fmt(r.tvl_usd)} × peer multiple ×${r.multiple.toFixed(2)} <span style="color:var(--muted)">(${esc(r.peer_basis)})</span><br>
-      growth&nbsp;= ×${r.growth_mult.toFixed(2)} <span style="color:var(--muted)">(7-day TVL ${r.change_7d === null ? 'unreported, scored neutral' : (r.change_7d >= 0 ? '+' : '') + r.change_7d.toFixed(1) + '%'})</span><br>
+      size&nbsp;&nbsp;&nbsp;= ×${r.size_mult.toFixed(2)} <span style="color:var(--muted)">(fitted size slope ${R.fit.size_slope.toFixed(2)}: peer ratios shrink as TVL grows, so large TVL is tempered)</span><br>
+      growth&nbsp;= ×${r.growth_mult.toFixed(2)} <span style="color:var(--muted)">(7-day TVL ${r.change_7d === null ? 'unreported, scored neutral' : (r.change_7d >= 0 ? '+' : '') + r.change_7d.toFixed(1) + '%'}, fitted momentum beta ${R.fit.growth_beta.toFixed(3)} per +1%)</span><br>
       maturity = ×${r.age_mult.toFixed(2)} <span style="color:var(--muted)">(${r.age_days === null ? 'age unknown, scored as 1 year' : r.age_days + ' days tracked with no token'})</span><br>
-      <span class="res">implied = ${fmt(implied)}</span>
+      <span class="res">implied = ${fmt(implied)}</span><br>
+      range&nbsp;&nbsp;= ${fmt(r.band_low_usd)} – ${fmt(r.band_high_usd)} <span style="color:var(--muted)">(this category's interquartile peer multiples, 25th–75th percentile, through the same factors)</span>
     </div>
     <h2 style="margin-top:18px">How to farm it</h2>
     <ol class="plan">
@@ -156,6 +164,19 @@ $('liveRows').innerHTML = R.live.map((p) => `
     <td class="num">${fmt(p.mcap_usd)}</td>
     <td class="num">×${p.ratio.toFixed(2)}</td>
   </tr>`).join('');
+
+// --- set aside ------------------------------------------------------------------
+const ASIDE_SHOWN = 40;
+$('asideRows').innerHTML = R.aside.slice(0, ASIDE_SHOWN).map((p) => `
+  <tr>
+    <td><span class="pname">${esc(p.name)}</span><br><span class="pslug">${esc(p.slug)}</span></td>
+    <td>${esc(p.category || '—')}</td>
+    <td class="num">${fmt(p.tvl_usd)}</td>
+    <td>${esc(p.reason)}</td>
+  </tr>`).join('');
+$('asideCount').textContent = R.aside.length > ASIDE_SHOWN
+  ? `Showing the ${ASIDE_SHOWN} largest of ${R.aside.length} set-aside entries, by TVL.`
+  : `${R.aside.length} entries set aside in total.`;
 
 for (const id of ['q', 'cat', 'chain', 'minTvl', 'sort', 'watchOnly']) {
   $(id).addEventListener('input', renderBoard);
